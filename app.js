@@ -429,12 +429,13 @@
     show(form);
   }
 
-  function runQuiz(quiz, att) {
-    const key = "attempt:" + quiz.id;
+  function runQuiz(quiz, att, opts) {
+    const preview = !!(opts && opts.preview);
+    const key = (preview ? "preview:" : "attempt:") + quiz.id;
     const byId = Object.fromEntries(quiz.questions.map((q) => [q.id, q]));
     const save = () => store.set(key, att);
-    const isEval = quiz.mode === "evaluation";
-    const deadline = quiz.duration ? att.start + quiz.duration * 60000 : 0;
+    const isEval = !preview && quiz.mode === "evaluation";
+    const deadline = !preview && quiz.duration ? att.start + quiz.duration * 60000 : 0;
     let timerEl, timerInt, finished = false, warnEl;
 
     const onHide = () => {
@@ -548,6 +549,9 @@
           h("div", { class: "row spread" },
             countEl,
             quiz.context ? h("button", { class: "btn small", onclick: () => docsPanel(quiz), text: "Voir les documents" }) : null)),
+        preview ? h("div", { class: "banner ok row spread" },
+          h("span", { text: "Aperçu enseignant : vous voyez le QCM comme un élève. Rien n'est enregistré." }),
+          h("a", { class: "btn small", href: "#prof", text: "Quitter l'aperçu" })) : null,
         warnEl,
         h("section", { class: "stack" },
           h("div", { class: "row" }, h("span", { class: "pill", text: TYPES[typeOf(q)] }),
@@ -590,6 +594,10 @@
       if (finished) return;
       finished = true;
       runCleanup && runCleanup();
+      if (preview) {
+        store.del(key);
+        return viewResult(quiz, gradeLocally(quiz, att.answers), att, { preview: true });
+      }
       const payload = { action: "submit", quizId: quiz.id, nom: att.student.nom, prenom: att.student.prenom,
         classe: att.student.classe, answers: att.answers, durationSec: Math.round((Date.now() - att.start) / 1000), leaves: att.leaves };
       loading("Envoi de votre copie…");
@@ -617,6 +625,54 @@
     if (deadline) timerInt = setInterval(tick, 1000);
     if (deadline && Date.now() >= deadline) return submit();
     screen();
+  }
+
+  /** Même notation que le script Google (utilisée pour l'aperçu enseignant). */
+  function partLocal(q, a) {
+    if (a === undefined || a === null) return 0;
+    const t = typeOf(q);
+    if (t === "single") return a === q.correct ? 1 : 0;
+    if (t === "multi") {
+      if (!Array.isArray(a)) return 0;
+      const good = q.corrects || [];
+      const sel = a.filter((x, i) => a.indexOf(x) === i);
+      const ok = sel.filter((x) => good.includes(x)).length;
+      return good.length ? Math.max(0, (ok - (sel.length - ok)) / good.length) : 0;
+    }
+    if (t === "number") return typeof a === "number" && Math.abs(a - Number(q.answer)) <= (Number(q.tolerance) || 0) + 1e-9 ? 1 : 0;
+    if (t === "match") return Array.isArray(a) && q.items.length ? q.items.filter((it, i) => a[i] === it.answer).length / q.items.length : 0;
+    return 0;
+  }
+
+  function gradeLocally(quiz, answers) {
+    let score = 0, total = 0;
+    const details = quiz.questions.map((q) => {
+      const a = answers[q.id], part = partLocal(q, a), pts = Number(q.points) || 1;
+      total += pts; score += part * pts;
+      return { id: q.id, chosen: a === undefined ? null : a, part, ok: part === 1 };
+    });
+    score = Math.round(score * 100) / 100;
+    return { score, total, note: total ? Math.round((score / total) * 2000) / 100 : 0, correction: { details, questions: quiz.questions } };
+  }
+
+  async function viewPreview(id) {
+    if (!pwd()) return viewLogin();
+    if (!cache.length) {
+      loading();
+      try { cache = (await teacherPost({ action: "all" })).quizzes || []; } catch (e) { return errorView(e.message); }
+    }
+    const quiz = cache.find((q) => q.id === id);
+    if (!quiz) return errorView("QCM introuvable.");
+    const ids = quiz.questions.map((q) => q.id);
+    let att = store.get("preview:" + quiz.id, null);
+    if (!(att && att.order && att.order.length === ids.length && att.order.every((x) => ids.includes(x)))) {
+      const optOrder = {};
+      quiz.questions.forEach((q) => { if (q.options) { const idx = q.options.map((_, i) => i); optOrder[q.id] = quiz.shuffle ? shuffle(idx) : idx; } });
+      att = { student: { nom: "Aperçu", prenom: "Enseignant", classe: "" }, order: quiz.shuffle ? shuffle(ids) : ids.slice(),
+        optOrder, answers: {}, start: Date.now(), leaves: 0, idx: 0 };
+      store.set("preview:" + quiz.id, att);
+    }
+    runQuiz(quiz, att, { preview: true });
   }
 
   function correctionBody(q, a, part) {
@@ -660,15 +716,19 @@
     return null;
   }
 
-  function viewResult(quiz, res, att) {
+  function viewResult(quiz, res, att, opts) {
+    const preview = !!(opts && opts.preview);
     const nodes = [h("div", { class: "card stack" },
       h("span", { class: "label", text: quiz.title }),
-      h("h1", { text: "Copie envoyée" }),
-      h("p", { class: "muted", text: att.student.prenom + " " + att.student.nom + (att.student.classe ? " · " + att.student.classe : "") }),
+      h("h1", { text: preview ? "Fin de l'aperçu" : "Copie envoyée" }),
+      preview ? h("p", { class: "muted", text: "Voici la note et la correction que verrait un élève ayant répondu comme vous (selon les réglages du QCM, l'élève peut ne voir que sa note). Rien n'a été enregistré." })
+        : h("p", { class: "muted", text: att.student.prenom + " " + att.student.nom + (att.student.classe ? " · " + att.student.classe : "") }),
       res.score !== undefined ? h("div", { class: "score" },
         h("b", { text: fmtNum(res.note) }), h("span", { text: "/ 20" }),
         h("span", { class: "muted", text: "(" + fmtNum(res.score) + " point(s) sur " + fmtNum(res.total) + ")" })) : null,
-      h("div", { class: "row" }, h("a", { class: "btn", href: "#", text: "Retour à l'accueil" })))];
+      h("div", { class: "row" }, preview
+        ? h("a", { class: "btn", href: "#prof", text: "Retour à mes QCM" })
+        : h("a", { class: "btn", href: "#", text: "Retour à l'accueil" })))];
     if (res.correction) {
       const qs = Object.fromEntries(res.correction.questions.map((q) => [q.id, q]));
       const det = Object.fromEntries(res.correction.details.map((d) => [d.id, d]));
@@ -857,6 +917,7 @@
         while (cells.length && cells[cells.length - 1] === "") cells.pop();
         return cells.length > 1 ? "| " + cells.join(" | ") + " |" : (cells[0] || "");
       })
+      .filter((l) => !/^Facultatif : collez ici les documents/i.test(l))
       .join("\n").replace(/\n{3,}/g, "\n\n").trim() : "";
     const mode = /eval/.test(norm(getP("mode"))) ? "evaluation" : "entrainement";
     const quiz = {
@@ -969,15 +1030,20 @@
   function teacherCard(q) {
     const card = h("article", { class: "card quiz-card" });
     const render = () => {
+      card.classList.toggle("is-open", !!q.open);
       card.replaceChildren(
         h("div", { class: "row spread" },
-          h("h2", { text: q.title }),
-          h("div", { class: "row" },
-            h("span", { class: "pill" + (q.mode === "evaluation" ? " eval" : ""), text: q.mode === "evaluation" ? "Évaluation" : "Entraînement" }),
-            h("span", { class: "pill " + (q.open ? "open" : "closed"), text: q.open ? "Ouvert" : "Fermé" }))),
+          h("h2", {}, h("a", { class: "titlelink", href: "#prof/apercu/" + encodeURIComponent(q.id), title: "Voir un aperçu du QCM", text: q.title })),
+          h("span", { class: "pill" + (q.mode === "evaluation" ? " eval" : ""), text: q.mode === "evaluation" ? "Évaluation" : "Entraînement" })),
         h("div", { class: "meta" }, h("span", { text: q.questions.length + " questions" }), q.duration ? h("span", { text: "· " + q.duration + " min" }) : null),
+        h("button", { class: "switch" + (q.open ? " on" : ""), type: "button", role: "switch", "aria-checked": String(!!q.open), onclick: toggle },
+          h("span", { class: "track" }, h("span", { class: "knob" })),
+          h("span", { class: "switch-text" },
+            h("strong", { text: q.open ? "Ouvert aux élèves" : "Fermé aux élèves" }),
+            h("span", { class: "muted small", text: q.open ? "Les élèves le voient et peuvent envoyer leur copie. Touchez pour fermer."
+              : "Invisible pour les élèves. Touchez pour l'ouvrir." }))),
         h("div", { class: "row" },
-          h("button", { class: "btn small" + (q.open ? "" : " primary"), onclick: toggle, text: q.open ? "Fermer aux élèves" : "Ouvrir aux élèves" }),
+          h("a", { class: "btn small primary", href: "#prof/apercu/" + encodeURIComponent(q.id), text: "Aperçu" }),
           h("a", { class: "btn small", href: "#prof/res/" + encodeURIComponent(q.id), text: "Résultats" }),
           h("a", { class: "btn small", href: "#prof/edit/" + encodeURIComponent(q.id), text: "Modifier" }),
           h("button", { class: "btn small", onclick: duplicate, text: "Dupliquer" }),
@@ -1401,6 +1467,7 @@
     if (parts[0] === "qcm" && parts[1]) return viewQuiz(parts[1]);
     if (parts[0] === "prof" && parts[1] === "edit" && parts[2]) return viewEditor(parts[2]);
     if (parts[0] === "prof" && parts[1] === "res" && parts[2]) return viewResults(parts[2]);
+    if (parts[0] === "prof" && parts[1] === "apercu" && parts[2]) return viewPreview(parts[2]);
     if (parts[0] === "prof") return viewTeacher();
     return viewHome();
   }
