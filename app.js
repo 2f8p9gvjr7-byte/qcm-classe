@@ -734,7 +734,7 @@
         h("div", { class: "row" },
           h("a", { class: "btn primary", href: "#prof/edit/new", text: "Nouveau QCM" }),
           h("label", { class: "btn", for: "importFile" }, "Importer un QCM",
-            h("input", { type: "file", id: "importFile", accept: ".json,application/json", hidden: true, onchange: importQuiz })),
+            h("input", { type: "file", id: "importFile", accept: ".xlsx,.xlsm,.xls,.ods,.json", hidden: true, onchange: importQuiz })),
           h("button", { class: "btn ghost", onclick: () => { session.del("qcm-pwd"); viewLogin(); }, text: "Se déconnecter" }))),
       h("p", { class: "muted", text: "Seuls les QCM ouverts sont visibles par les élèves. Ouvrez-les au début de la séance et fermez-les à la fin." }),
       cache.length ? list : h("div", { class: "card empty" }, h("h2", { text: "Aucun QCM" }),
@@ -742,36 +742,228 @@
         h("a", { class: "btn primary", href: "#prof/edit/new", text: "Créer un QCM" })));
   }
 
-  /** Importe un QCM depuis un fichier .json (exporté par l'application ou fourni tout prêt). */
+  /* ---------- Import / export Excel ---------- */
+
+  const XL_HEAD = ["N°", "Type", "Question", "Points", "Bonne réponse", "Tolérance (chiffrée)", "Unité (chiffrée)", "Explication"];
+  const XL_PROPS = 8;
+  const XL_TYPES = { single: "Une réponse", multi: "Plusieurs réponses", number: "Chiffrée", match: "Flèches" };
+
+  /** Charge la bibliothèque de lecture Excel (fichier local) seulement quand on en a besoin. */
+  function loadXLSX() {
+    if (window.XLSX) return Promise.resolve(window.XLSX);
+    return new Promise((resolve, reject) => {
+      const sc = document.createElement("script");
+      sc.src = "xlsx.full.min.js";
+      sc.onload = () => (window.XLSX ? resolve(window.XLSX) : reject(new Error("Lecteur Excel indisponible.")));
+      sc.onerror = () => reject(new Error("Le fichier xlsx.full.min.js est introuvable : envoyez-le sur GitHub avec les autres fichiers."));
+      document.head.append(sc);
+    });
+  }
+
+  const norm = (v) => String(v === undefined || v === null ? "" : v).normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/\s+/g, " ").trim();
+  const yes = (v) => /^(oui|o|yes|y|vrai|true|1|x)$/.test(norm(v));
+  const cellText = (v) => (v === undefined || v === null ? "" : String(v).trim());
+
+  function findSheet(wb, ...names) {
+    const wanted = names.map(norm);
+    const name = wb.SheetNames.find((n) => wanted.includes(norm(n)));
+    return name ? wb.Sheets[name] : null;
+  }
+
+  function typeFromCell(v) {
+    const t = norm(v);
+    if (!t || t.startsWith("une") || t.startsWith("single") || t.startsWith("qcm")) return "single";
+    if (t.startsWith("plusieurs") || t.startsWith("multi")) return "multi";
+    if (t.startsWith("chiffr") || t.startsWith("nombre") || t.startsWith("numer")) return "number";
+    if (t.startsWith("fl") || t.startsWith("assoc") || t.startsWith("relier") || t.startsWith("match")) return "match";
+    return null;
+  }
+
+  /** « B », « A,C », « 1;3 », « A et C » → index 0-based. */
+  function goodIndexes(v, n) {
+    const t = cellText(v).toUpperCase();
+    const out = [];
+    (t.match(/[A-H]|\d+/g) || []).forEach((tok) => {
+      const k = /\d/.test(tok) ? Number(tok) - 1 : LETTERS.indexOf(tok);
+      if (k >= 0 && k < n && !out.includes(k)) out.push(k);
+    });
+    return out;
+  }
+
+  /** Lit un classeur au format du modèle et renvoie { quiz, errors }. */
+  function quizFromWorkbook(XLSX, wb, fileName) {
+    const errors = [];
+    const params = {};
+    const ps = findSheet(wb, "Paramètres", "Parametres", "Paramètre");
+    if (ps) XLSX.utils.sheet_to_json(ps, { header: 1, raw: false, defval: "" }).forEach((r) => { if (r[0]) params[norm(r[0])] = cellText(r[1]); });
+    const getP = (...keys) => { for (const k of keys) { const f = Object.keys(params).find((p) => p.startsWith(norm(k))); if (f !== undefined) return params[f]; } return ""; };
+
+    const qs = findSheet(wb, "Questions") || wb.Sheets[wb.SheetNames.find((n) => !/param|doc|mode/i.test(norm(n))) || wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(qs, { header: 1, raw: true, defval: "" });
+    const hi = rows.findIndex((r) => r.some((c) => norm(c) === "question"));
+    if (hi < 0) return { errors: ["Onglet « Questions » : la ligne de titres (avec une colonne « Question ») est introuvable."] };
+    const head = rows[hi].map(norm);
+    const col = (name) => head.findIndex((c) => c.startsWith(norm(name)));
+    const C = { type: col("type"), text: col("question"), points: col("points"), good: col("bonne"), tol: col("tolerance"),
+      unit: col("unite"), expl: col("explication") };
+    const propCols = head.map((c, i) => (c.startsWith("proposition") || c.startsWith("reponse ") ? i : -1)).filter((i) => i >= 0);
+
+    const questions = [];
+    rows.slice(hi + 1).forEach((r, k) => {
+      const line = hi + 2 + k;
+      const text = cellText(r[C.text]);
+      if (!text) return;
+      const where = "Ligne " + line + " (« " + text.slice(0, 40) + (text.length > 40 ? "…" : "") + " ») : ";
+      const t = typeFromCell(C.type >= 0 ? r[C.type] : "");
+      if (!t) return errors.push(where + "type inconnu « " + cellText(r[C.type]) + " ». Choisissez : Une réponse, Plusieurs réponses, Chiffrée ou Flèches.");
+      const pts = parseNum(C.points >= 0 ? r[C.points] : "") ;
+      const q = { id: "q" + (questions.length + 1) + "-" + uid("x").slice(2), type: t, text,
+        points: pts && pts > 0 ? pts : 1, explanation: C.expl >= 0 ? cellText(r[C.expl]) : "" };
+      const props = propCols.map((i) => cellText(r[i])).filter(Boolean);
+      const good = C.good >= 0 ? r[C.good] : "";
+      if (t === "single" || t === "multi") {
+        q.options = props.map((p) => { const [txt, why] = p.split(/\s*\/\/\s*/); return { text: txt, why: why || "" }; });
+        if (q.options.length < 2) return errors.push(where + "il faut au moins 2 propositions.");
+        const idx = goodIndexes(good, q.options.length);
+        if (!idx.length) return errors.push(where + "indiquez la bonne réponse (lettre A, B… ou numéro de la proposition).");
+        if (t === "single" && idx.length > 1) return errors.push(where + "plusieurs bonnes réponses indiquées : choisissez le type « Plusieurs réponses ».");
+        if (t === "single") q.correct = idx[0]; else q.corrects = idx.sort((a, b) => a - b);
+      } else if (t === "number") {
+        q.answer = typeof good === "number" ? good : parseNum(good);
+        if (q.answer === null || !isFinite(q.answer)) return errors.push(where + "la bonne réponse doit être un nombre.");
+        q.tolerance = Math.abs(parseNum(C.tol >= 0 ? r[C.tol] : "") || 0);
+        q.unit = C.unit >= 0 ? cellText(r[C.unit]) : "";
+      } else {
+        q.choices = []; q.items = [];
+        for (const p of props) {
+          const parts = p.split(/\s*(?:->|→|=>|⟶)\s*/);
+          if (parts.length !== 2 || !parts[1]) return errors.push(where + "« " + p + " » : écrivez « élément -> réponse » (ou « -> réponse » pour une réponse sans flèche).");
+          let k = q.choices.indexOf(parts[1]);
+          if (k < 0) { q.choices.push(parts[1]); k = q.choices.length - 1; }
+          if (parts[0]) q.items.push({ text: parts[0], answer: k });
+        }
+        if (q.choices.length < 2) return errors.push(where + "il faut au moins 2 réponses différentes à droite.");
+        if (!q.items.length) return errors.push(where + "aucun élément à relier.");
+      }
+      questions.push(q);
+    });
+    if (!questions.length && !errors.length) errors.push("Aucune question trouvée dans l'onglet « Questions ».");
+
+    const ds = findSheet(wb, "Documents", "Document");
+    const context = ds ? XLSX.utils.sheet_to_json(ds, { header: 1, raw: false, defval: "" })
+      .map((r) => {
+        const cells = r.map(cellText);
+        while (cells.length && cells[cells.length - 1] === "") cells.pop();
+        return cells.length > 1 ? "| " + cells.join(" | ") + " |" : (cells[0] || "");
+      })
+      .join("\n").replace(/\n{3,}/g, "\n\n").trim() : "";
+    const mode = /eval/.test(norm(getP("mode"))) ? "evaluation" : "entrainement";
+    const quiz = {
+      id: "", title: getP("titre") || String(fileName || "QCM").replace(/\.[^.]+$/, ""),
+      mode, open: false, duration: Math.max(0, parseNum(getP("duree")) || 0),
+      shuffle: getP("melanger") === "" ? false : yes(getP("melanger")),
+      showScore: getP("montrer la note") === "" ? true : yes(getP("montrer la note")),
+      showCorrection: getP("montrer la correction") === "" ? mode !== "evaluation" : yes(getP("montrer la correction")),
+      context, questions,
+    };
+    return { quiz, errors };
+  }
+
+  /** Construit un classeur au même format que le modèle. */
+  function workbookFromQuiz(XLSX, q) {
+    const wb = XLSX.utils.book_new();
+    const yn = (b) => (b ? "Oui" : "Non");
+    const params = [["Paramètre", "Valeur"], ["Titre", q.title], ["Mode", q.mode === "evaluation" ? "Évaluation" : "Entraînement"],
+      ["Durée (minutes)", q.duration || 0], ["Mélanger", yn(q.shuffle)], ["Montrer la note", yn(q.showScore !== false)],
+      ["Montrer la correction", yn(q.showCorrection)]];
+    const head = XL_HEAD.concat(Array.from({ length: XL_PROPS }, (_, i) => "Proposition " + (i + 1)));
+    const rows = [head].concat(q.questions.map((qu, i) => {
+      const t = typeOf(qu);
+      let good = "", tol = "", unit = "", props = [];
+      if (t === "single" || t === "multi") {
+        props = qu.options.map((o) => (o.why ? o.text + " // " + o.why : o.text));
+        good = t === "single" ? LETTERS[qu.correct] : (qu.corrects || []).map((k) => LETTERS[k]).join(",");
+      } else if (t === "number") { good = qu.answer; tol = qu.tolerance || 0; unit = qu.unit || ""; }
+      else {
+        const used = new Set();
+        props = qu.items.map((it) => { used.add(it.answer); return it.text + " -> " + qu.choices[it.answer]; })
+          .concat(qu.choices.filter((_, k) => !used.has(k)).map((c) => "-> " + c));
+      }
+      return [i + 1, XL_TYPES[t], qu.text, qu.points || 1, good, tol, unit, qu.explanation || ""].concat(props);
+    }));
+    const p = XLSX.utils.aoa_to_sheet(params);
+    p["!cols"] = [{ wch: 24 }, { wch: 50 }];
+    const s = XLSX.utils.aoa_to_sheet(rows);
+    s["!cols"] = [{ wch: 5 }, { wch: 18 }, { wch: 55 }, { wch: 7 }, { wch: 14 }, { wch: 11 }, { wch: 10 }, { wch: 45 }]
+      .concat(Array.from({ length: XL_PROPS }, () => ({ wch: 38 })));
+    XLSX.utils.book_append_sheet(wb, p, "Paramètres");
+    XLSX.utils.book_append_sheet(wb, s, "Questions");
+    const docs = String(q.context || "").split("\n").map((l) => {
+      const tl = l.trim();
+      if (tl.startsWith("|")) return /^\|[\s|:-]+\|?$/.test(tl) ? null : tl.replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+      return [l];
+    }).filter(Boolean);
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(docs.length ? docs : [[""]]), "Documents");
+    return wb;
+  }
+
+  function showImportErrors(errors) {
+    const box = h("div", { class: "card stack confirm", role: "alert" },
+      h("h2", { text: "Import impossible : " + errors.length + " point(s) à corriger dans le fichier" }),
+      h("ul", { class: "corrlist" }, errors.slice(0, 30).map((e) => h("li", { text: e }))),
+      errors.length > 30 ? h("p", { class: "muted small", text: "… et " + (errors.length - 30) + " autre(s)." }) : null,
+      h("p", { class: "muted small", text: "Corrigez ces lignes dans Excel, enregistrez, puis importez à nouveau le fichier." }),
+      h("div", {}, h("button", { class: "btn small", onclick: () => box.remove(), text: "Fermer" })));
+    app.prepend(box);
+    window.scrollTo(0, 0);
+  }
+
+  /** Importe un QCM depuis un fichier Excel (.xlsx) ou une sauvegarde (.json). */
   async function importQuiz(e) {
     const file = e.target.files && e.target.files[0];
     e.target.value = "";
     if (!file) return;
     let quiz;
-    try { quiz = JSON.parse(await file.text()); }
-    catch (err) { return toast("Ce fichier n'est pas un QCM lisible (format .json attendu)."); }
-    if (!quiz || !quiz.title || !Array.isArray(quiz.questions) || !quiz.questions.length)
-      return toast("Fichier incomplet : il faut un titre et au moins une question.");
+    if (/\.json$/i.test(file.name)) {
+      try { quiz = JSON.parse(await file.text()); }
+      catch (err) { return toast("Ce fichier .json n'est pas lisible."); }
+      if (!quiz || !quiz.title || !Array.isArray(quiz.questions) || !quiz.questions.length)
+        return toast("Fichier incomplet : il faut un titre et au moins une question.");
+    } else if (/\.(xlsx|xlsm|xls|ods)$/i.test(file.name)) {
+      let XLSX;
+      try { XLSX = await loadXLSX(); } catch (err) { return toast(err.message); }
+      let res;
+      try { res = quizFromWorkbook(XLSX, XLSX.read(await file.arrayBuffer(), { type: "array" }), file.name); }
+      catch (err) { return toast("Fichier Excel illisible : enregistrez-le au format .xlsx et réessayez."); }
+      if (res.errors.length) return showImportErrors(res.errors);
+      quiz = res.quiz;
+    } else {
+      return toast("Choisissez un fichier Excel (.xlsx) ou une sauvegarde (.json).");
+    }
     quiz.open = false;
     quiz.questions.forEach((q, i) => { if (!q.id) q.id = "q" + (i + 1) + "-" + uid("i").slice(2); });
     if (!quiz.id || cache.some((c) => c.id === quiz.id)) {
-      if (cache.some((c) => c.id === quiz.id)) quiz.title += " (importé)";
+      if (cache.some((c) => c.title === quiz.title)) quiz.title += " (importé)";
       quiz.id = slug(quiz.title) + "-" + uid("m").slice(2);
     }
     try {
       await teacherPost({ action: "save", quiz });
-      toast("QCM « " + quiz.title + " » importé. Il est fermé : ouvrez-le quand vous voulez.");
+      toast("QCM « " + quiz.title + " » importé (" + quiz.questions.length + " questions). Il est fermé : ouvrez-le quand vous voulez.");
       viewTeacher();
     } catch (err) { toast(err.message); }
   }
 
-  function exportQuiz(q) {
-    const copy = JSON.parse(JSON.stringify(q));
-    copy.open = false;
-    const a = h("a", { href: URL.createObjectURL(new Blob([JSON.stringify(copy, null, 1)], { type: "application/json" })),
-      download: slug(q.title) + ".json" });
+  async function exportQuiz(q) {
+    let XLSX;
+    try { XLSX = await loadXLSX(); } catch (err) { return toast(err.message); }
+    const data = XLSX.write(workbookFromQuiz(XLSX, q), { bookType: "xlsx", type: "array" });
+    const blob = new Blob([data], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const name = (q.title.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[–—]/g, "-")
+      .replace(/[^A-Za-z0-9 ()_.,'-]/g, "").replace(/\s+/g, " ").trim().slice(0, 80) || "QCM") + ".xlsx";
+    const a = h("a", { href: URL.createObjectURL(blob), download: name });
     document.body.append(a); a.click(); a.remove();
-    toast("Fichier téléchargé : vous pouvez le garder en sauvegarde ou le réimporter.");
+    toast("Fichier Excel téléchargé : modifiez-le puis réimportez-le avec « Importer un QCM ».");
   }
 
   function teacherCard(q) {
@@ -789,7 +981,7 @@
           h("a", { class: "btn small", href: "#prof/res/" + encodeURIComponent(q.id), text: "Résultats" }),
           h("a", { class: "btn small", href: "#prof/edit/" + encodeURIComponent(q.id), text: "Modifier" }),
           h("button", { class: "btn small", onclick: duplicate, text: "Dupliquer" }),
-          h("button", { class: "btn small", onclick: () => exportQuiz(q), text: "Exporter" }),
+          h("button", { class: "btn small", onclick: () => exportQuiz(q), text: "Exporter (Excel)" }),
           h("button", { class: "btn small danger", onclick: askDelete, text: "Supprimer" })));
     };
     async function toggle() {
