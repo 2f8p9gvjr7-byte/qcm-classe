@@ -214,7 +214,7 @@
     single: "Une seule bonne réponse",
     multi: "Plusieurs bonnes réponses",
     number: "Réponse chiffrée",
-    match: "Association (relier)",
+    match: "Association (flèches à relier)",
   };
   const typeOf = (q) => q.type || "single";
 
@@ -243,6 +243,136 @@
     if (t === "number") return fmtNum(a);
     if (t === "match") return a.map((x, i) => (i + 1) + (x === null || x === undefined ? "-" : LETTERS[x])).join(" ");
     return "";
+  }
+
+  /* ---------- Flèches à relier ---------- */
+
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  let boardSeq = 0;
+
+  /**
+   * Deux colonnes d'éléments reliés par des flèches.
+   * cur[i] = index de la réponse reliée à l'élément i (ou null).
+   * opts.readonly : affichage seul (correction) ; opts.status[i] : true/false pour colorer juste/faux.
+   */
+  function arrowBoard(q, cur, onChange, opts) {
+    opts = opts || {};
+    const ro = !!opts.readonly;
+    const id = "ab" + (++boardSeq);
+    const order = opts.rightOrder || q.choices.map((_, k) => k);
+    let activeL = null, activeR = null;
+    const colorOf = (i) => "var(--c" + ((i % 6) + 1) + ")";
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "arrows-svg");
+    svg.setAttribute("aria-hidden", "true");
+    const tip = h("p", { class: "muted small arrows-tip", "aria-live": "polite" });
+    const leftBtns = q.items.map((it, i) => h("button", {
+      type: "button", class: "anode left", "data-i": String(i), disabled: ro,
+      onclick: () => pickLeft(i),
+    }, h("span", { class: "atext", text: it.text }), h("span", { class: "dotc" })));
+    const rightBtns = {};
+    order.forEach((k) => {
+      rightBtns[k] = h("button", { type: "button", class: "anode right", "data-k": String(k), disabled: ro, onclick: () => pickRight(k) },
+        h("span", { class: "dotc" }), h("span", { class: "atext", text: q.choices[k] }));
+    });
+    const removeBtn = h("button", { type: "button", class: "btn small", hidden: true, onclick: () => {
+      if (activeL !== null) { cur[activeL] = null; activeL = null; changed(); }
+    }, text: "Retirer cette flèche" });
+    const clearBtn = h("button", { type: "button", class: "btn small ghost", hidden: true, onclick: () => {
+      cur.fill(null); activeL = activeR = null; changed();
+    }, text: "Effacer toutes les flèches" });
+    const board = h("div", { class: "arrows" + (ro ? " readonly" : "") },
+      h("div", { class: "arrows-col left" }, leftBtns),
+      h("div", { class: "arrows-col right" }, order.map((k) => rightBtns[k])));
+    board.prepend(svg);
+
+    function link(i, k) { cur[i] = k; activeL = activeR = null; changed(); }
+    function pickLeft(i) {
+      if (activeR !== null) return link(i, activeR);
+      activeL = activeL === i ? null : i;
+      paint();
+    }
+    function pickRight(k) {
+      if (activeL !== null) return link(activeL, k);
+      activeR = activeR === k ? null : k;
+      paint();
+    }
+    function changed() { if (onChange) onChange(cur.slice()); paint(); }
+
+    function paint() {
+      leftBtns.forEach((b, i) => {
+        const linked = cur[i] !== null && cur[i] !== undefined;
+        b.classList.toggle("active", activeL === i);
+        b.classList.toggle("linked", linked);
+        b.style.setProperty("--lc", opts.status ? (opts.status[i] ? "var(--ok)" : "var(--bad)") : colorOf(i));
+        b.setAttribute("aria-label", q.items[i].text + (linked ? " – relié à : " + q.choices[cur[i]] : " – non relié"));
+        b.setAttribute("aria-pressed", String(activeL === i));
+      });
+      Object.entries(rightBtns).forEach(([k, b]) => {
+        b.classList.toggle("active", activeR === Number(k));
+        b.classList.toggle("linked", cur.includes(Number(k)));
+        b.setAttribute("aria-pressed", String(activeR === Number(k)));
+      });
+      if (!ro) {
+        if (activeL !== null) tip.textContent = "Touchez maintenant la réponse qui correspond à « " + q.items[activeL].text + " ».";
+        else if (activeR !== null) tip.textContent = "Touchez maintenant l'élément de gauche qui correspond à « " + q.choices[activeR] + " ».";
+        else tip.textContent = "";
+        removeBtn.hidden = !(activeL !== null && cur[activeL] !== null && cur[activeL] !== undefined);
+        clearBtn.hidden = !cur.some((x) => x !== null && x !== undefined);
+      }
+      draw();
+    }
+
+    function draw() {
+      if (!board.isConnected) return;
+      const box = board.getBoundingClientRect();
+      if (!box.width) return;
+      svg.setAttribute("viewBox", "0 0 " + box.width + " " + box.height);
+      const defs = document.createElementNS(SVG_NS, "defs");
+      const paths = [];
+      cur.forEach((k, i) => {
+        if (k === null || k === undefined || !rightBtns[k]) return;
+        const L = leftBtns[i].getBoundingClientRect(), R = rightBtns[k].getBoundingClientRect();
+        const x1 = L.right - box.left - 6, y1 = L.top + L.height / 2 - box.top;
+        const x2 = R.left - box.left + 4, y2 = R.top + R.height / 2 - box.top;
+        const dx = Math.max(16, (x2 - x1) / 2);
+        const color = opts.status ? (opts.status[i] ? "var(--ok)" : "var(--bad)") : colorOf(i);
+        const mid = id + "-m" + i;
+        const marker = document.createElementNS(SVG_NS, "marker");
+        marker.setAttribute("id", mid);
+        marker.setAttribute("viewBox", "0 0 10 10");
+        marker.setAttribute("refX", "9"); marker.setAttribute("refY", "5");
+        marker.setAttribute("markerWidth", "7"); marker.setAttribute("markerHeight", "7");
+        marker.setAttribute("orient", "auto-start-reverse");
+        const head = document.createElementNS(SVG_NS, "path");
+        head.setAttribute("d", "M0,0 L10,5 L0,10 z");
+        head.style.fill = color;
+        marker.append(head);
+        defs.append(marker);
+        const p = document.createElementNS(SVG_NS, "path");
+        p.setAttribute("d", "M" + x1 + "," + y1 + " C" + (x1 + dx) + "," + y1 + " " + (x2 - dx) + "," + y2 + " " + x2 + "," + y2);
+        p.setAttribute("fill", "none");
+        p.setAttribute("stroke-width", "2.5");
+        p.setAttribute("stroke-linecap", "round");
+        p.style.stroke = color;
+        p.setAttribute("marker-end", "url(#" + mid + ")");
+        paths.push(p);
+      });
+      svg.replaceChildren(defs, ...paths);
+    }
+
+    // Redessine quand la taille change ; se détache quand la question n'est plus affichée.
+    let seen = false, obs = null;
+    const onResize = () => {
+      if (board.isConnected) { seen = true; draw(); return; }
+      if (seen) { window.removeEventListener("resize", onResize); if (obs) obs.disconnect(); }
+    };
+    if ("ResizeObserver" in window) { obs = new ResizeObserver(onResize); obs.observe(board); }
+    window.addEventListener("resize", onResize);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(draw);
+    requestAnimationFrame(() => paint());
+    paint();
+    return h("div", { class: "stack" }, board, ro ? null : tip, ro ? null : h("div", { class: "row" }, removeBtn, clearBtn));
   }
 
   /* ---------- Élève : passage du QCM ---------- */
@@ -377,20 +507,19 @@
       }
       if (t === "match") {
         const cur = Array.isArray(a) ? a.slice() : q.items.map(() => null);
+        while (cur.length < q.items.length) cur.push(null);
+        att.rightOrder = att.rightOrder || {};
+        if (!att.rightOrder[qid] || att.rightOrder[qid].length !== q.choices.length) {
+          const idx = q.choices.map((_, k) => k);
+          att.rightOrder[qid] = quiz.shuffle ? shuffle(idx) : idx;
+          save();
+        }
         return h("div", { class: "stack" },
-          h("p", { class: "muted small", text: "Associez chaque élément à la bonne réponse. Une même réponse peut servir plusieurs fois." }),
-          h("div", { class: "match" }, q.items.map((it, i) => {
-            const sel = h("select", { id: "m-" + i, "aria-label": it.text },
-              h("option", { value: "", text: "— Choisir —" }),
-              q.choices.map((c, k) => h("option", { value: String(k), text: c })));
-            sel.value = cur[i] === null || cur[i] === undefined ? "" : String(cur[i]);
-            sel.addEventListener("change", () => {
-              cur[i] = sel.value === "" ? null : Number(sel.value);
-              if (cur.some((x) => x !== null)) att.answers[qid] = cur.slice(); else delete att.answers[qid];
-              save(); refreshProgress();
-            });
-            return h("label", { class: "matchrow" }, h("span", { class: "matchtext", text: it.text }), sel);
-          })));
+          h("p", { class: "muted small", text: "Touchez un élément à gauche, puis la réponse qui lui correspond à droite : une flèche les relie. Pour changer une flèche, touchez à nouveau l'élément de gauche. Une même réponse peut recevoir plusieurs flèches." }),
+          arrowBoard(q, cur, (c) => {
+            if (c.some((x) => x !== null && x !== undefined)) att.answers[qid] = c; else delete att.answers[qid];
+            save(); refreshProgress();
+          }, { rightOrder: att.rightOrder[qid] }));
       }
       return h("p", { text: "Type de question non pris en charge." });
     }
@@ -518,13 +647,15 @@
         part === 1 ? null : h("p", {}, h("strong", { text: "Réponse attendue : " }), fmtNum(q.answer) + unit + tol));
     }
     if (t === "match") {
-      const cur = Array.isArray(a) ? a : [];
-      return h("ul", { class: "corrlist" }, q.items.map((it, i) => {
+      const cur = Array.isArray(a) ? a.slice() : [];
+      while (cur.length < q.items.length) cur.push(null);
+      const board = arrowBoard(q, cur.slice(), null, { readonly: true, status: q.items.map((it, i) => cur[i] === it.answer) });
+      return h("div", { class: "stack" }, board, h("ul", { class: "corrlist" }, q.items.map((it, i) => {
         const mine = cur[i], ok = mine === it.answer;
         return h("li", {}, h("strong", { text: it.text + " → " }),
           h("span", { class: ok ? "tag-ok" : "tag-bad", text: mine === null || mine === undefined ? "sans réponse" : q.choices[mine] }),
           ok ? null : h("span", { class: "muted", text: " (attendu : " + q.choices[it.answer] + ")" }));
-      }));
+      })));
     }
     return null;
   }
@@ -602,11 +733,45 @@
         h("h1", { text: "Mes QCM" }),
         h("div", { class: "row" },
           h("a", { class: "btn primary", href: "#prof/edit/new", text: "Nouveau QCM" }),
+          h("label", { class: "btn", for: "importFile" }, "Importer un QCM",
+            h("input", { type: "file", id: "importFile", accept: ".json,application/json", hidden: true, onchange: importQuiz })),
           h("button", { class: "btn ghost", onclick: () => { session.del("qcm-pwd"); viewLogin(); }, text: "Se déconnecter" }))),
       h("p", { class: "muted", text: "Seuls les QCM ouverts sont visibles par les élèves. Ouvrez-les au début de la séance et fermez-les à la fin." }),
       cache.length ? list : h("div", { class: "card empty" }, h("h2", { text: "Aucun QCM" }),
         h("p", { text: "Créez un QCM ou importez vos questions depuis Excel." }),
         h("a", { class: "btn primary", href: "#prof/edit/new", text: "Créer un QCM" })));
+  }
+
+  /** Importe un QCM depuis un fichier .json (exporté par l'application ou fourni tout prêt). */
+  async function importQuiz(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    let quiz;
+    try { quiz = JSON.parse(await file.text()); }
+    catch (err) { return toast("Ce fichier n'est pas un QCM lisible (format .json attendu)."); }
+    if (!quiz || !quiz.title || !Array.isArray(quiz.questions) || !quiz.questions.length)
+      return toast("Fichier incomplet : il faut un titre et au moins une question.");
+    quiz.open = false;
+    quiz.questions.forEach((q, i) => { if (!q.id) q.id = "q" + (i + 1) + "-" + uid("i").slice(2); });
+    if (!quiz.id || cache.some((c) => c.id === quiz.id)) {
+      if (cache.some((c) => c.id === quiz.id)) quiz.title += " (importé)";
+      quiz.id = slug(quiz.title) + "-" + uid("m").slice(2);
+    }
+    try {
+      await teacherPost({ action: "save", quiz });
+      toast("QCM « " + quiz.title + " » importé. Il est fermé : ouvrez-le quand vous voulez.");
+      viewTeacher();
+    } catch (err) { toast(err.message); }
+  }
+
+  function exportQuiz(q) {
+    const copy = JSON.parse(JSON.stringify(q));
+    copy.open = false;
+    const a = h("a", { href: URL.createObjectURL(new Blob([JSON.stringify(copy, null, 1)], { type: "application/json" })),
+      download: slug(q.title) + ".json" });
+    document.body.append(a); a.click(); a.remove();
+    toast("Fichier téléchargé : vous pouvez le garder en sauvegarde ou le réimporter.");
   }
 
   function teacherCard(q) {
@@ -624,6 +789,7 @@
           h("a", { class: "btn small", href: "#prof/res/" + encodeURIComponent(q.id), text: "Résultats" }),
           h("a", { class: "btn small", href: "#prof/edit/" + encodeURIComponent(q.id), text: "Modifier" }),
           h("button", { class: "btn small", onclick: duplicate, text: "Dupliquer" }),
+          h("button", { class: "btn small", onclick: () => exportQuiz(q), text: "Exporter" }),
           h("button", { class: "btn small danger", onclick: askDelete, text: "Supprimer" })));
     };
     async function toggle() {
@@ -845,7 +1011,7 @@
           h("div", { class: "stack" }, choiceRows),
           q.choices.length < 8 ? h("div", {}, h("button", { class: "btn small", type: "button", onclick: () => { q.choices.push(""); renderQuestions(); }, text: "+ Ajouter une réponse" })) : null,
           h("span", { class: "label", text: "Éléments à relier et leur bonne réponse" }),
-          h("p", { class: "muted small", text: "Une même réponse peut convenir à plusieurs éléments (ex. : emploi / ressource). Points partiels selon le nombre d'associations justes." }),
+          h("p", { class: "muted small", text: "Les élèves relient chaque élément à sa réponse en traçant une flèche. Une même réponse peut recevoir plusieurs flèches (ex. : emploi / ressource). Points partiels selon le nombre de flèches justes. Mettez les réponses dans le désordre, ou cochez « Mélanger » dans les réglages du QCM." }),
           h("div", { class: "stack" }, itemRows),
           h("div", {}, h("button", { class: "btn small", type: "button", onclick: () => { q.items.push({ text: "", answer: -1 }); renderQuestions(); }, text: "+ Ajouter un élément" })));
       }
