@@ -1449,6 +1449,7 @@
         h("div", { class: "row" },
           h("button", { class: "btn", onclick: () => viewResults(id), text: "Actualiser" }),
           n ? h("button", { class: "btn", onclick: csv, text: "Exporter (CSV)" }) : null,
+          n ? h("a", { class: "btn primary", href: "#prof/notes/" + encodeURIComponent(id), text: "Envoyer les notes par e-mail" }) : null,
           h("a", { class: "btn ghost", href: "#prof", text: "Retour" }))),
       h("div", { class: "stats" },
         h("div", { class: "card stat" }, h("span", { class: "label", text: "Copies" }), h("b", { text: String(n) })),
@@ -1573,6 +1574,125 @@
       h("p", { class: "muted small", text: "Données personnelles : ces adresses restent dans votre Google Drive. Informez vos élèves de leur usage et supprimez la liste en fin d'année." }));
   }
 
+  /** Fenêtre de confirmation centrée pour les envois d'e-mails, avec le compte rendu au même endroit. */
+  function mailDialog({ question, warning, run }) {
+    const box = h("div", { class: "modal-box stack", role: "dialog", "aria-modal": "true", "aria-label": "Confirmer l'envoi" });
+    const wrap = h("div", { class: "modal" }, box);
+    const close = () => { wrap.remove(); document.removeEventListener("keydown", onKey); };
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+    document.addEventListener("keydown", onKey);
+    const confirmBtn = h("button", { class: "btn primary", type: "button", id: "confirmSend", text: "Oui, envoyer" });
+    box.append(h("h2", { text: "Confirmer l'envoi" }), question,
+      warning ? h("p", { class: "banner warn", text: warning }) : null,
+      h("div", { class: "row" }, confirmBtn, h("button", { class: "btn ghost", type: "button", onclick: close, text: "Annuler" })));
+    confirmBtn.addEventListener("click", async () => {
+      confirmBtn.disabled = true; confirmBtn.textContent = "Envoi en cours…";
+      try {
+        const res = await run();
+        quotaCache = res.quota;
+        box.replaceChildren(h("h2", { text: "Envoi terminé" }),
+          h("div", { class: "banner " + (res.failed.length ? "warn" : "ok"), text: res.sent + " e-mail(s) envoyé(s)" + (res.failed.length ? ", " + res.failed.length + " non envoyé(s)." : ".") }),
+          res.failed.length ? h("ul", { class: "corrlist" }, res.failed.map((f) =>
+            h("li", { text: (((f.prenom || "") + " " + (f.nom || "")).trim() || f.email || "") + (f.email && (f.prenom || f.nom) ? " – " + f.email : "") + " : " + f.raison }))) : null,
+          h("p", { class: "muted small", text: "Les messages envoyés par un script arrivent souvent dans les courriers indésirables la première fois : prévenez vos élèves." }),
+          res.quota !== null && res.quota !== undefined ? h("p", { class: "muted small", text: "Envois encore possibles aujourd'hui : " + res.quota + "." }) : null,
+          h("div", { class: "row" }, h("button", { class: "btn primary", type: "button", onclick: () => { close(); location.hash = "prof"; }, text: "Retour à mes QCM" }),
+            h("button", { class: "btn ghost", type: "button", onclick: close, text: "Fermer" })));
+      } catch (e) {
+        const auth = /autoris|permission|MailApp|script\.send_mail|Action inconnue/i.test(e.message);
+        box.replaceChildren(h("h2", { text: "Envoi impossible" }),
+          h("p", { text: auth ? "Le script Google n'est pas à jour ou n'a pas l'autorisation d'envoyer des e-mails. Dans Apps Script : collez le dernier Code.gs, exécutez une fois « autoriserEmails », puis publiez une nouvelle version (voir le guide)." : e.message }),
+          h("div", {}, h("button", { class: "btn", type: "button", onclick: close, text: "Fermer" })));
+      }
+    });
+    document.body.append(wrap);
+    confirmBtn.focus();
+  }
+
+  /* ---------- Envoi des notes ---------- */
+
+  const DEFAULT_GRADE_MSG = "Bonjour {prenom},\n\nVotre résultat au QCM « {titre} » : {note}/20 ({score} point(s) sur {total}).\n\n{correction}\nBonne continuation !";
+  const keyOf = (nom, prenom) => norm(nom + "|" + prenom);
+
+  async function viewSendGrades(id) {
+    if (!pwd()) return viewLogin();
+    loading("Préparation de l'envoi des notes…");
+    let data, students;
+    try { [data, students] = await Promise.all([teacherPost({ action: "results", id }), loadStudents(true)]); }
+    catch (e) { return errorView(e.message, () => viewSendGrades(id)); }
+    const quiz = data.quiz;
+    if (!quiz) return errorView("QCM introuvable.");
+    const latest = {};
+    (data.results || []).forEach((r) => { const k = keyOf(r.nom, r.prenom); if (!latest[k] || r.date > latest[k].date) latest[k] = r; });
+    const emails = {};
+    students.forEach((e) => { if (RE_EMAIL.test(e.email)) emails[keyOf(e.nom, e.prenom)] = e.email; });
+    const rows = Object.entries(latest).map(([k, r]) => ({ k, r, email: emails[k] || "" }))
+      .sort((a, b) => String(a.r.classe).localeCompare(String(b.r.classe)) || String(a.r.nom).localeCompare(String(b.r.nom), "fr"));
+    if (!rows.length) return show(h("div", { class: "card stack" }, h("h1", { text: "Envoyer les notes" }),
+      h("p", { text: "Aucune copie reçue pour ce QCM." }), h("div", {}, h("a", { class: "btn", href: "#prof/res/" + encodeURIComponent(id), text: "Retour" }))));
+    const checked = new Set(rows.filter((x) => x.email).map((x) => x.k));
+    const listBox = h("div", { class: "picklist" });
+    const subject = h("input", { type: "text", id: "gradeSubject", value: "Votre résultat : {titre}" });
+    const message = h("textarea", { id: "gradeMessage", rows: "8", value: DEFAULT_GRADE_MSG });
+    const withCorr = h("input", { type: "checkbox", id: "withCorrection", checked: false });
+    const preview = h("pre", { class: "mailpreview" });
+    const btns = [h("button", { class: "btn primary", type: "button" }), h("button", { class: "btn primary", type: "button", id: "sendGradesBtn" })];
+    const missing = rows.filter((x) => !x.email).length;
+
+    function fill(tpl, x) {
+      const v = { prenom: x.r.prenom, nom: x.r.nom, classe: x.r.classe, titre: quiz.title, note: fmtNum(x.r.note), score: fmtNum(x.r.score), total: fmtNum(x.r.total),
+        correction: withCorr.checked ? "Correction détaillée :\n[pour chaque question : sa réponse, la bonne réponse et l'explication]\n" : "" };
+      return String(tpl).replace(/\{(prenom|nom|classe|titre|note|score|total|correction)\}/gi, (m, k) => v[k.toLowerCase()] || "");
+    }
+    function refresh() {
+      const sendable = rows.filter((x) => x.email);
+      listBox.replaceChildren(
+        h("label", { class: "check pickall" }, h("input", { type: "checkbox", checked: sendable.length && sendable.every((x) => checked.has(x.k)),
+          onchange: (ev) => { sendable.forEach((x) => (ev.target.checked ? checked.add(x.k) : checked.delete(x.k))); refresh(); } }),
+          h("strong", { text: "Tout cocher (" + sendable.length + ")" })),
+        ...rows.map((x) => h("label", { class: "check" + (x.email ? "" : " disabled") },
+          h("input", { type: "checkbox", disabled: !x.email, checked: checked.has(x.k), onchange: (ev) => { ev.target.checked ? checked.add(x.k) : checked.delete(x.k); refresh(); } }),
+          h("span", { text: (x.r.prenom + " " + x.r.nom).trim() + (x.r.classe ? " · " + x.r.classe : "") }),
+          h("strong", { text: fmtNum(x.r.note) + "/20" }),
+          h("span", { class: "muted small", text: x.email || "pas d'adresse dans Mes élèves" }))));
+      const n = rows.filter((x) => checked.has(x.k)).length;
+      btns.forEach((b) => { b.textContent = "Envoyer à " + n + " élève(s)"; b.disabled = !n; });
+      const first = rows.find((x) => checked.has(x.k)) || rows[0];
+      preview.textContent = "À : " + (first.email || "(pas d'adresse)") + "\nObjet : " + fill(subject.value, first) + "\n\n" + fill(message.value, first)
+        + (withCorr.checked && !/\{correction\}/i.test(message.value) ? "\n\nCorrection détaillée : [...]" : "");
+    }
+    [subject, message].forEach((el) => el.addEventListener("input", refresh));
+    withCorr.addEventListener("change", refresh);
+    const doSend = () => {
+      const keys = rows.filter((x) => checked.has(x.k)).map((x) => x.k);
+      mailDialog({
+        question: h("p", {}, "Envoyer maintenant leur note à ", h("strong", { text: keys.length + " élève(s)" }),
+          withCorr.checked ? ", avec la correction détaillée," : "", " depuis votre adresse Gmail ?"),
+        warning: quiz.open ? "Ce QCM est encore ouvert : les élèves qui n'ont pas fini pourraient recevoir la correction d'un camarade. Fermez-le d'abord si l'épreuve n'est pas terminée." : "",
+        run: () => teacherPost({ action: "sendGrades", quizId: quiz.id, keys, subject: subject.value, message: message.value, withCorrection: withCorr.checked }),
+      });
+    };
+    btns.forEach((b) => b.addEventListener("click", doSend));
+    refresh();
+    show(
+      h("div", { class: "row spread" },
+        h("div", { class: "stack" }, h("span", { class: "label", text: "Envoyer les notes" }), h("h1", { text: quiz.title })),
+        h("div", { class: "row" }, btns[0], h("a", { class: "btn ghost", href: "#prof/res/" + encodeURIComponent(id), text: "Retour" }))),
+      h("p", { class: "muted", text: "Chaque élève reçoit la note de sa dernière copie, à l'adresse indiquée dans « Mes élèves » (rapprochement par nom et prénom)." }),
+      missing ? h("div", { class: "banner warn", text: missing + " élève(s) sans adresse e-mail : ajoutez-les dans « Mes élèves » avec exactement le même nom et prénom que sur leur copie." }) : null,
+      h("section", { class: "card stack" }, h("h2", { text: "Élèves" }), listBox,
+        h("p", { class: "muted small" }, h("a", { href: "#prof/eleves", text: "Modifier la liste d'élèves" }),
+          quotaCache !== null && quotaCache !== undefined ? " · Envois encore possibles aujourd'hui : " + quotaCache : "")),
+      h("section", { class: "card stack" },
+        h("h2", { text: "Message" }),
+        h("label", { class: "check" }, withCorr, "Joindre la correction détaillée (réponse de l'élève, bonne réponse et explication pour chaque question)"),
+        h("label", { class: "field" }, h("span", { text: "Objet" }), subject),
+        h("label", { class: "field" }, h("span", { text: "Texte" }), message),
+        h("p", { class: "muted small", text: "Repères : {prenom}, {nom}, {classe}, {titre}, {note}, {score}, {total}, {correction}." }),
+        h("span", { class: "label", text: "Aperçu pour le premier élève" }), preview),
+      h("div", { class: "row" }, btns[1]));
+  }
+
   /* ---------- Envoi du lien ---------- */
 
   const DEFAULT_MSG = "Bonjour {prenom},\n\nVoici le lien de votre QCM « {titre} » :\n{lien}\n\nCe lien est personnel : votre nom est déjà rempli. Ne le transmettez pas.\n\nBon courage !";
@@ -1605,6 +1725,7 @@
     const message = h("textarea", { id: "mailMessage", rows: "8", value: DEFAULT_MSG });
     const preview = h("pre", { class: "mailpreview" });
     const sendBtn = h("button", { class: "btn primary", type: "button", id: "sendBtn" });
+    const sendTop = h("button", { class: "btn primary", type: "button", onclick: () => sendBtn.click() });
     const area = h("div", { class: "stack" });
     const visible = () => withMail.map((e, i) => [e, i]).filter(([e]) => !classSel.value || (e.classe || "Sans classe") === classSel.value);
     const selected = () => visible().filter(([, i]) => checked.has(i)).map(([e]) => e);
@@ -1623,8 +1744,8 @@
           h("input", { type: "checkbox", checked: checked.has(i), onchange: (ev) => { ev.target.checked ? checked.add(i) : checked.delete(i); refresh(); } }),
           h("span", { text: (e.prenom + " " + e.nom).trim() + (e.classe ? " · " + e.classe : "") }), h("span", { class: "muted small", text: e.email }))));
       const sel = selected();
-      sendBtn.textContent = "Envoyer à " + sel.length + " élève(s)";
-      sendBtn.disabled = !sel.length;
+      sendBtn.textContent = sendTop.textContent = "Envoyer à " + sel.length + " élève(s)";
+      sendBtn.disabled = sendTop.disabled = !sel.length;
       const first = sel[0] || vis[0] && vis[0][0];
       preview.textContent = first ? "À : " + first.email + "\nObjet : " + fill(subject.value, first) + "\n\n" + fill(message.value, first) : "";
     }
@@ -1634,37 +1755,19 @@
 
     sendBtn.addEventListener("click", () => {
       const sel = selected();
-      area.replaceChildren(h("div", { class: "card stack confirm" },
-        h("p", {}, "Envoyer maintenant le lien à ", h("strong", { text: sel.length + " élève(s)" }), " depuis votre adresse Gmail ?"),
-        !quiz.open ? h("p", { class: "banner warn", text: "Ce QCM est fermé : les élèves recevront le lien, mais ne pourront commencer qu'une fois le QCM ouvert." }) : null,
-        h("div", { class: "row" },
-          h("button", { class: "btn primary", type: "button", id: "confirmSend", onclick: async (ev) => {
-            ev.target.disabled = true; ev.target.textContent = "Envoi en cours…";
-            try {
-              const res = await teacherPost({ action: "sendLinks", quizId: quiz.id, appUrl, subject: subject.value, message: message.value,
-                recipients: sel.map((e) => ({ nom: e.nom, prenom: e.prenom, classe: e.classe, email: e.email })) });
-              quotaCache = res.quota;
-              area.replaceChildren(h("div", { class: "card stack" },
-                h("div", { class: "banner " + (res.failed.length ? "warn" : "ok"), text: res.sent + " e-mail(s) envoyé(s)" + (res.failed.length ? ", " + res.failed.length + " échec(s)." : ".") }),
-                res.failed.length ? h("ul", { class: "corrlist" }, res.failed.map((f) => h("li", { text: ((f.prenom || "") + " " + (f.nom || "")).trim() + " – " + f.email + " : " + f.raison }))) : null,
-                res.quota !== null && res.quota !== undefined ? h("p", { class: "muted small", text: "Envois encore possibles aujourd'hui : " + res.quota + "." }) : null,
-                h("div", { class: "row" }, h("a", { class: "btn", href: "#prof", text: "Retour à mes QCM" }))));
-            } catch (e) {
-              const auth = /autoris|permission|MailApp|script\.send_mail/i.test(e.message);
-              area.replaceChildren(h("div", { class: "card stack confirm" },
-                h("p", { text: auth ? "Le script n'a pas encore l'autorisation d'envoyer des e-mails. Dans Apps Script, exécutez une fois « autoriserEmails », acceptez l'autorisation, puis publiez une nouvelle version (voir le guide)." : e.message }),
-                h("div", {}, h("button", { class: "btn small", type: "button", onclick: () => area.replaceChildren(), text: "Fermer" }))));
-            }
-          }, text: "Oui, envoyer" }),
-          h("button", { class: "btn ghost", type: "button", onclick: () => area.replaceChildren(), text: "Annuler" }))));
-      area.scrollIntoView({ behavior: "smooth", block: "center" });
+      mailDialog({
+        question: h("p", {}, "Envoyer maintenant le lien à ", h("strong", { text: sel.length + " élève(s)" }), " depuis votre adresse Gmail ?"),
+        warning: !quiz.open ? "Ce QCM est fermé : les élèves recevront le lien, mais ne pourront commencer qu'une fois le QCM ouvert." : "",
+        run: () => teacherPost({ action: "sendLinks", quizId: quiz.id, appUrl, subject: subject.value, message: message.value,
+          recipients: sel.map((e) => ({ nom: e.nom, prenom: e.prenom, classe: e.classe, email: e.email })) }),
+      });
     });
 
     refresh();
     show(
       h("div", { class: "row spread" },
         h("div", { class: "stack" }, h("span", { class: "label", text: "Envoyer le lien" }), h("h1", { text: quiz.title })),
-        h("a", { class: "btn ghost", href: "#prof", text: "Retour" })),
+        h("div", { class: "row" }, sendTop, h("a", { class: "btn ghost", href: "#prof", text: "Retour" }))),
       !quiz.open ? h("div", { class: "banner warn", text: "Ce QCM est actuellement fermé : pensez à l'ouvrir au début de la séance, sinon les élèves verront « pas encore ouvert »." }) : null,
       h("section", { class: "card stack" },
         h("div", { class: "row spread" }, h("h2", { text: "Destinataires" }), classes.length > 1 ? classSel : null),
@@ -1686,6 +1789,7 @@
 
   function route() {
     if (runCleanup && !location.hash.startsWith("#qcm/")) runCleanup();
+    document.querySelectorAll(".modal, .docs").forEach((m) => m.remove());
     const [path, query] = location.hash.replace(/^#/, "").split("?");
     const parts = path.split("/").map((p) => { try { return decodeURIComponent(p); } catch (e) { return p; } });
     const params = new URLSearchParams(query || "");
@@ -1693,6 +1797,7 @@
     if (parts[0] === "qcm" && parts[1]) return viewQuiz(parts[1], params);
     if (parts[0] === "prof" && parts[1] === "eleves") return viewStudents();
     if (parts[0] === "prof" && parts[1] === "envoi" && parts[2]) return viewSend(parts[2]);
+    if (parts[0] === "prof" && parts[1] === "notes" && parts[2]) return viewSendGrades(parts[2]);
     if (parts[0] === "prof" && parts[1] === "edit" && parts[2]) return viewEditor(parts[2]);
     if (parts[0] === "prof" && parts[1] === "res" && parts[2]) return viewResults(parts[2]);
     if (parts[0] === "prof" && parts[1] === "apercu" && parts[2]) return viewPreview(parts[2]);
