@@ -1443,6 +1443,47 @@
       document.body.append(a); a.click(); a.remove();
     }
 
+    const who = (r) => (r.prenom + " " + r.nom).trim() + (r.classe ? " (" + r.classe + ")" : "");
+
+    function deleteOne(r) {
+      confirmDialog({
+        title: "Supprimer cette copie ?",
+        body: [h("p", { text: "Copie de " + who(r) + ", note " + fmtNum(r.note) + "/20, envoyée le " + new Date(r.date).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" }) + "." }),
+          h("p", { class: "muted small", text: "La ligne sera retirée de l'onglet « Résultats ». L'élève pourra repasser le QCM s'il est ouvert." })],
+        okText: "Supprimer la copie",
+        run: async () => {
+          await teacherPost({ action: "deleteResult", quizId: id, date: r.date, nom: r.nom, prenom: r.prenom });
+          toast("Copie supprimée."); viewResults(id);
+        },
+      });
+    }
+
+    function clearDialog() {
+      const classes = [...new Set(rows.map((r) => String(r.classe || "").trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b, "fr"));
+      const sel = h("select", { id: "clearClass" }, h("option", { value: "", text: "Toutes les classes" }), classes.map((c) => h("option", { value: c, text: c })));
+      const arch = h("input", { type: "checkbox", id: "clearArchive", checked: true });
+      const info = h("p", { class: "banner warn" });
+      const upd = () => {
+        const k = rows.filter((r) => !sel.value || String(r.classe || "").trim() === sel.value).length;
+        info.textContent = k + " copie(s) seront retirées de ce QCM" + (sel.value ? " pour la classe " + sel.value : "") + "." +
+          (arch.checked ? " Elles seront conservées dans l'onglet « Archives » du Google Sheets." : " Attention : sans archivage, elles seront définitivement perdues.");
+      };
+      sel.addEventListener("change", upd); arch.addEventListener("change", upd); upd();
+      confirmDialog({
+        title: "Effacer les résultats",
+        body: [h("p", { text: "Pour repartir à zéro avec un nouveau groupe ou retirer vos copies de test." }),
+          classes.length > 1 ? h("label", { class: "field" }, h("span", { text: "Copies à effacer" }), sel) : null,
+          h("label", { class: "row" }, arch, h("span", { text: "Archiver avant d'effacer (recommandé)" })), info,
+          h("p", { class: "muted small", text: "Le QCM lui-même n'est pas supprimé." })],
+        okText: "Effacer",
+        run: async () => {
+          const res = await teacherPost({ action: "clearResults", quizId: id, classe: sel.value, archive: arch.checked });
+          toast(res.removed + " copie(s) effacée(s)" + (res.archived ? " et archivée(s)." : "."));
+          viewResults(id);
+        },
+      });
+    }
+
     show(
       h("div", { class: "row spread" },
         h("div", { class: "stack" }, h("span", { class: "label", text: "Résultats" }), h("h1", { text: quiz.title })),
@@ -1450,6 +1491,7 @@
           h("button", { class: "btn", onclick: () => viewResults(id), text: "Actualiser" }),
           n ? h("button", { class: "btn", onclick: csv, text: "Exporter (CSV)" }) : null,
           n ? h("a", { class: "btn primary", href: "#prof/notes/" + encodeURIComponent(id), text: "Envoyer les notes par e-mail" }) : null,
+          n ? h("button", { class: "btn danger", id: "clearBtn", type: "button", onclick: clearDialog, text: "Effacer les résultats" }) : null,
           h("a", { class: "btn ghost", href: "#prof", text: "Retour" }))),
       h("div", { class: "stats" },
         h("div", { class: "card stat" }, h("span", { class: "label", text: "Copies" }), h("b", { text: String(n) })),
@@ -1458,12 +1500,14 @@
         h("div", { class: "card stat" }, h("span", { class: "label", text: "Sorties de page" }), h("b", { text: String(flagged) }))),
       n ? h("div", { class: "tablewrap" }, h("table", { class: "data" },
         h("thead", {}, h("tr", {}, ["Nom", "Prénom", "Classe"].map((t) => h("th", { text: t })),
-          ["Note /20", "Durée (min)", "Sorties"].map((t) => h("th", { class: "num", text: t })), h("th", { text: "Envoyée le" }))),
+          ["Note /20", "Durée (min)", "Sorties"].map((t) => h("th", { class: "num", text: t })), h("th", { text: "Envoyée le" }), h("th", { text: "" }))),
         h("tbody", {}, rows.map((r) => h("tr", {},
           h("td", { text: r.nom }), h("td", { text: r.prenom }), h("td", { text: r.classe }),
           h("td", { class: "num", text: fmtNum(r.note) }), h("td", { class: "num", text: fmtNum(r.duree) }),
           h("td", { class: "num" + (Number(r.sorties) > 0 ? " flag" : ""), text: String(r.sorties) }),
-          h("td", { text: new Date(r.date).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" }) }))))))
+          h("td", { text: new Date(r.date).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" }) }),
+          h("td", {}, h("button", { class: "btn small ghost delrow", type: "button", title: "Supprimer cette copie",
+            "aria-label": "Supprimer la copie de " + r.prenom + " " + r.nom, onclick: () => deleteOne(r), text: "✕" })))))))
         : h("div", { class: "card empty" }, h("p", { text: "Aucune copie reçue pour ce QCM." })),
       n ? h("section", { class: "card stack" },
         h("h2", { text: "Réussite par question" }),
@@ -1572,6 +1616,26 @@
             const ins = body.querySelectorAll("tr:last-child input"); if (ins[0]) ins[0].focus(); }, text: "+ Ajouter un élève" }),
           h("button", { class: "btn primary", type: "button", id: "saveStudents", onclick: saveAll, text: "Enregistrer la liste" }))),
       h("p", { class: "muted small", text: "Données personnelles : ces adresses restent dans votre Google Drive. Informez vos élèves de leur usage et supprimez la liste en fin d'année." }));
+  }
+
+  /** Fenêtre de confirmation centrée pour une action irréversible (bouton rouge). */
+  function confirmDialog({ title, body, okText, run }) {
+    const box = h("div", { class: "modal-box stack", role: "dialog", "aria-modal": "true", "aria-label": title });
+    const wrap = h("div", { class: "modal" }, box);
+    const close = () => { wrap.remove(); document.removeEventListener("keydown", onKey); };
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+    document.addEventListener("keydown", onKey);
+    const ok = h("button", { class: "btn danger solid", type: "button", id: "confirmOk", text: okText });
+    const err = h("p", { class: "banner warn", hidden: true });
+    box.append(h("h2", { text: title }), ...body.filter(Boolean), err,
+      h("div", { class: "row" }, ok, h("button", { class: "btn ghost", type: "button", onclick: close, text: "Annuler" })));
+    ok.addEventListener("click", async () => {
+      ok.disabled = true; ok.textContent = "Un instant…";
+      try { await run(); close(); }
+      catch (e) { err.hidden = false; err.textContent = /Action inconnue/i.test(e.message) ? "Le script Google n'est pas à jour : collez le dernier Code.gs et publiez une nouvelle version." : e.message; ok.disabled = false; ok.textContent = okText; }
+    });
+    document.body.append(wrap);
+    ok.focus();
   }
 
   /** Fenêtre de confirmation centrée pour les envois d'e-mails, avec le compte rendu au même endroit. */
