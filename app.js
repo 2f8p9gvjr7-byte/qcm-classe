@@ -379,22 +379,30 @@
 
   let runCleanup = null;
 
-  async function viewQuiz(id) {
+  async function viewQuiz(id, params) {
+    const personal = params && (params.get("n") || params.get("p"))
+      ? { nom: params.get("n") || "", prenom: params.get("p") || "", classe: params.get("c") || "" } : null;
     loading("Ouverture du QCM…");
     let quiz;
     try { quiz = (await apiGet({ action: "quiz", id })).quiz; }
-    catch (e) { return errorView(e.message, () => viewQuiz(id)); }
+    catch (e) {
+      const closed = /pas disponible/i.test(e.message);
+      return errorView(closed ? "Ce QCM n'est pas encore ouvert. Votre enseignant l'ouvrira au début de la séance : réessayez à ce moment-là." : e.message,
+        () => viewQuiz(id, params));
+    }
     const key = "attempt:" + quiz.id;
     const att = store.get(key, null);
     const ids = quiz.questions.map((q) => q.id);
-    const valid = att && att.student && att.order && att.order.length === ids.length && att.order.every((x) => ids.includes(x));
+    const same = (a, b) => norm(a) === norm(b);
+    const valid = att && att.student && att.order && att.order.length === ids.length && att.order.every((x) => ids.includes(x))
+      && (!personal || (same(att.student.nom, personal.nom) && same(att.student.prenom, personal.prenom)));
     if (valid) return runQuiz(quiz, att);
     store.del(key);
-    viewIdentity(quiz);
+    viewIdentity(quiz, personal);
   }
 
-  function viewIdentity(quiz) {
-    const who = store.get("student", { nom: "", prenom: "", classe: "" });
+  function viewIdentity(quiz, personal) {
+    const who = personal || store.get("student", { nom: "", prenom: "", classe: "" });
     const form = h("form", { class: "card stack" },
       h("h1", { text: quiz.title }),
       h("div", { class: "row" },
@@ -402,7 +410,12 @@
         h("span", { class: "muted small", text: quiz.questions.length + " questions" + (quiz.duration ? " · " + quiz.duration + " min" : "") })),
       quiz.mode === "evaluation" ? h("div", { class: "banner warn" },
         "Évaluation : vos réponses sont envoyées à votre enseignant. Si vous quittez cette page pendant le QCM (autre onglet, autre application), ce sera signalé.") : null,
-      h("div", { class: "grid2" },
+      personal ? h("div", { class: "banner ok", id: "whoBanner" }, "Lien personnel : ",
+        h("strong", { text: (who.prenom + " " + who.nom).trim() + (who.classe ? " · " + who.classe : "") }), ". ",
+        h("button", { class: "linkbtn", type: "button", onclick: (ev) => {
+          form.querySelector(".grid2").hidden = false; ev.target.closest(".banner").hidden = true; form.querySelector("#nom").focus();
+        }, text: "Ce n'est pas moi" })) : null,
+      h("div", { class: "grid2", hidden: !!personal },
         h("label", { class: "field" }, h("span", { text: "Nom" }), h("input", { type: "text", id: "nom", required: true, value: who.nom, autocomplete: "family-name" })),
         h("label", { class: "field" }, h("span", { text: "Prénom" }), h("input", { type: "text", id: "prenom", required: true, value: who.prenom, autocomplete: "given-name" })),
         h("label", { class: "field" }, h("span", { text: "Classe" }), h("input", { type: "text", id: "classe", value: who.classe }))),
@@ -793,6 +806,7 @@
         h("h1", { text: "Mes QCM" }),
         h("div", { class: "row" },
           h("a", { class: "btn primary", href: "#prof/edit/new", text: "Nouveau QCM" }),
+          h("a", { class: "btn", href: "#prof/eleves", text: "Mes élèves" }),
           h("label", { class: "btn", for: "importFile" }, "Importer un QCM",
             h("input", { type: "file", id: "importFile", accept: ".xlsx,.xlsm,.xls,.ods,.json", hidden: true, onchange: importQuiz })),
           h("button", { class: "btn ghost", onclick: () => { session.del("qcm-pwd"); viewLogin(); }, text: "Se déconnecter" }))),
@@ -1044,6 +1058,7 @@
               : "Invisible pour les élèves. Touchez pour l'ouvrir." }))),
         h("div", { class: "row" },
           h("a", { class: "btn small primary", href: "#prof/apercu/" + encodeURIComponent(q.id), text: "Aperçu" }),
+          h("a", { class: "btn small", href: "#prof/envoi/" + encodeURIComponent(q.id), text: "Envoyer le lien" }),
           h("a", { class: "btn small", href: "#prof/res/" + encodeURIComponent(q.id), text: "Résultats" }),
           h("a", { class: "btn small", href: "#prof/edit/" + encodeURIComponent(q.id), text: "Modifier" }),
           h("button", { class: "btn small", onclick: duplicate, text: "Dupliquer" }),
@@ -1458,13 +1473,226 @@
       flagged ? h("p", { class: "muted small", text: "« Sorties » compte le nombre de fois où l'élève a quitté la page pendant une évaluation (autre onglet, autre application). C'est un indice, pas une preuve : un téléphone à côté de l'ordinateur n'est pas détecté." }) : null);
   }
 
+  /* ---------- Élèves ---------- */
+
+  const RE_EMAIL = /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/;
+  let studentsCache = null, quotaCache = null;
+
+  async function loadStudents(force) {
+    if (studentsCache && !force) return studentsCache;
+    const res = await teacherPost({ action: "students" });
+    studentsCache = res.students || [];
+    quotaCache = res.quota;
+    return studentsCache;
+  }
+
+  /** Colle depuis Excel / Pronote : Nom, Prénom, Classe, E-mail (ordre libre si une ligne de titres est présente). */
+  function parseStudentPaste(text) {
+    const rows = String(text).replace(/\r/g, "").split("\n").map((l) => l.split(/\t|;/).map((c) => c.trim())).filter((r) => r.some(Boolean));
+    if (!rows.length) return [];
+    let map = { nom: 0, prenom: 1, classe: 2, email: 3 };
+    const head = rows[0].map(norm);
+    if (head.some((c) => /mail|nom|prenom|classe/.test(c)) && !rows[0].some((c) => RE_EMAIL.test(c))) {
+      const f = (re) => head.findIndex((c) => re.test(c));
+      map = { nom: f(/^nom/), prenom: f(/^pr[eé]nom/), classe: f(/classe|groupe|division/), email: f(/mail/) };
+      rows.shift();
+    } else if (rows[0].length === 3 && rows.every((r) => r.length <= 3)) {
+      map = { nom: 0, prenom: 1, classe: -1, email: 2 };
+    }
+    return rows.map((r) => {
+      const g = (i) => (i >= 0 && r[i] ? r[i] : "");
+      let email = g(map.email);
+      if (!RE_EMAIL.test(email)) email = r.find((c) => RE_EMAIL.test(c)) || email;
+      return { nom: g(map.nom), prenom: g(map.prenom), classe: g(map.classe), email };
+    }).filter((e) => e.nom || e.prenom || e.email);
+  }
+
+  async function viewStudents() {
+    if (!pwd()) return viewLogin();
+    loading("Chargement de la liste…");
+    let list;
+    try { list = (await loadStudents(true)).map((e) => Object.assign({}, e)); } catch (e) { return errorView(e.message, viewStudents); }
+    const body = h("tbody");
+    const count = h("span", { class: "muted small" });
+    const pasteBox = h("textarea", { id: "pasteStudents", rows: "5",
+      placeholder: "Collez ici vos lignes copiées depuis Excel ou Pronote : Nom, Prénom, Classe, E-mail" });
+
+    function renderRows() {
+      body.replaceChildren(...list.map((e, i) => {
+        const inp = (k, ph, type) => {
+          const el = h("input", { type: type || "text", value: e[k], placeholder: ph, "aria-label": ph + " (ligne " + (i + 1) + ")" });
+          el.addEventListener("input", () => { e[k] = el.value.trim(); if (k === "email") el.classList.toggle("bad", !!el.value.trim() && !RE_EMAIL.test(el.value.trim())); });
+          if (k === "email" && e.email && !RE_EMAIL.test(e.email)) el.classList.add("bad");
+          return h("td", {}, el);
+        };
+        return h("tr", {}, inp("nom", "Nom"), inp("prenom", "Prénom"), inp("classe", "Classe"), inp("email", "E-mail", "email"),
+          h("td", {}, h("button", { class: "btn small ghost", type: "button", "aria-label": "Retirer la ligne " + (i + 1),
+            onclick: () => { list.splice(i, 1); renderRows(); }, text: "✕" })));
+      }));
+      count.textContent = list.length + " élève(s)";
+    }
+
+    async function saveAll() {
+      const clean = list.filter((e) => e.nom || e.prenom || e.email);
+      const bad = clean.find((e) => e.email && !RE_EMAIL.test(e.email));
+      if (bad) return toast("Adresse invalide : " + bad.email);
+      try {
+        studentsCache = (await teacherPost({ action: "saveStudents", students: clean })).students;
+        list = studentsCache.map((e) => Object.assign({}, e));
+        renderRows();
+        toast("Liste enregistrée (" + list.length + " élève(s)).");
+      } catch (e) { toast(e.message); }
+    }
+
+    renderRows();
+    show(
+      h("div", { class: "row spread" }, h("h1", { text: "Mes élèves" }), h("a", { class: "btn ghost", href: "#prof", text: "Retour" })),
+      h("p", { class: "muted", text: "Chaque élève de cette liste peut recevoir par e-mail un lien personnel vers un QCM : son nom, son prénom et sa classe y sont déjà remplis. La liste est enregistrée dans l'onglet « Élèves » de votre Google Sheets." }),
+      h("section", { class: "card stack" },
+        h("h2", { text: "Ajouter depuis Excel ou Pronote" }),
+        h("p", { class: "muted small", text: "Sélectionnez vos lignes dans Excel (colonnes Nom, Prénom, Classe, E-mail), copiez-les, collez-les ici. Une ligne de titres est reconnue automatiquement." }),
+        pasteBox,
+        h("div", { class: "row" }, h("button", { class: "btn small", type: "button", onclick: () => {
+          const added = parseStudentPaste(pasteBox.value);
+          if (!added.length) return toast("Aucune ligne reconnue.");
+          const known = new Set(list.map((e) => norm(e.email)).filter(Boolean));
+          const fresh = added.filter((e) => !e.email || !known.has(norm(e.email)));
+          list = list.concat(fresh);
+          pasteBox.value = "";
+          renderRows();
+          toast(fresh.length + " élève(s) ajouté(s)" + (added.length > fresh.length ? ", " + (added.length - fresh.length) + " déjà présent(s)" : "") + ". Pensez à enregistrer.");
+        }, text: "Ajouter à la liste" }))),
+      h("section", { class: "stack" },
+        h("div", { class: "row spread" }, h("h2", { text: "Liste" }), count),
+        h("div", { class: "tablewrap" }, h("table", { class: "data edit" },
+          h("thead", {}, h("tr", {}, ["Nom", "Prénom", "Classe", "E-mail", ""].map((t) => h("th", { text: t })))), body)),
+        h("div", { class: "row" },
+          h("button", { class: "btn", type: "button", onclick: () => { list.push({ nom: "", prenom: "", classe: "", email: "" }); renderRows();
+            const ins = body.querySelectorAll("tr:last-child input"); if (ins[0]) ins[0].focus(); }, text: "+ Ajouter un élève" }),
+          h("button", { class: "btn primary", type: "button", id: "saveStudents", onclick: saveAll, text: "Enregistrer la liste" }))),
+      h("p", { class: "muted small", text: "Données personnelles : ces adresses restent dans votre Google Drive. Informez vos élèves de leur usage et supprimez la liste en fin d'année." }));
+  }
+
+  /* ---------- Envoi du lien ---------- */
+
+  const DEFAULT_MSG = "Bonjour {prenom},\n\nVoici le lien de votre QCM « {titre} » :\n{lien}\n\nCe lien est personnel : votre nom est déjà rempli. Ne le transmettez pas.\n\nBon courage !";
+
+  async function viewSend(id) {
+    if (!pwd()) return viewLogin();
+    loading("Préparation de l'envoi…");
+    let students;
+    try {
+      if (!cache.length) cache = (await teacherPost({ action: "all" })).quizzes || [];
+      students = await loadStudents(true);
+    } catch (e) { return errorView(e.message, () => viewSend(id)); }
+    const quiz = cache.find((q) => q.id === id);
+    if (!quiz) return errorView("QCM introuvable.");
+    const appUrl = location.origin + location.pathname;
+    const withMail = students.filter((e) => RE_EMAIL.test(e.email));
+    if (!withMail.length) {
+      return show(h("div", { class: "card stack" },
+        h("h1", { text: "Envoyer le lien" }),
+        h("p", { text: "Votre liste d'élèves est vide, ou aucun élève n'a d'adresse e-mail." }),
+        h("div", { class: "row" }, h("a", { class: "btn primary", href: "#prof/eleves", text: "Compléter la liste d'élèves" }),
+          h("a", { class: "btn ghost", href: "#prof", text: "Retour" }))));
+    }
+    const classes = Array.from(new Set(withMail.map((e) => e.classe || "Sans classe"))).sort((a, b) => a.localeCompare(b, "fr"));
+    const checked = new Set(withMail.map((e, i) => i));
+    const classSel = h("select", { id: "classSel", "aria-label": "Classe" },
+      h("option", { value: "", text: "Toutes les classes" }), classes.map((c) => h("option", { value: c, text: c })));
+    const listBox = h("div", { class: "picklist" });
+    const subject = h("input", { type: "text", id: "mailSubject", value: "QCM : " + quiz.title });
+    const message = h("textarea", { id: "mailMessage", rows: "8", value: DEFAULT_MSG });
+    const preview = h("pre", { class: "mailpreview" });
+    const sendBtn = h("button", { class: "btn primary", type: "button", id: "sendBtn" });
+    const area = h("div", { class: "stack" });
+    const visible = () => withMail.map((e, i) => [e, i]).filter(([e]) => !classSel.value || (e.classe || "Sans classe") === classSel.value);
+    const selected = () => visible().filter(([, i]) => checked.has(i)).map(([e]) => e);
+
+    function fill(tpl, e) {
+      const lien = appUrl + "#qcm/" + encodeURIComponent(quiz.id) + "?n=" + encodeURIComponent(e.nom) + "&p=" + encodeURIComponent(e.prenom) + "&c=" + encodeURIComponent(e.classe);
+      return String(tpl).replace(/\{(prenom|nom|classe|titre|lien)\}/gi, (m, k) => ({ prenom: e.prenom, nom: e.nom, classe: e.classe, titre: quiz.title, lien })[k.toLowerCase()] || "");
+    }
+    function refresh() {
+      const vis = visible();
+      listBox.replaceChildren(
+        h("label", { class: "check pickall" }, h("input", { type: "checkbox", checked: vis.length && vis.every(([, i]) => checked.has(i)),
+          onchange: (ev) => { vis.forEach(([, i]) => (ev.target.checked ? checked.add(i) : checked.delete(i))); refresh(); } }),
+          h("strong", { text: "Tout cocher (" + vis.length + ")" })),
+        ...vis.map(([e, i]) => h("label", { class: "check" },
+          h("input", { type: "checkbox", checked: checked.has(i), onchange: (ev) => { ev.target.checked ? checked.add(i) : checked.delete(i); refresh(); } }),
+          h("span", { text: (e.prenom + " " + e.nom).trim() + (e.classe ? " · " + e.classe : "") }), h("span", { class: "muted small", text: e.email }))));
+      const sel = selected();
+      sendBtn.textContent = "Envoyer à " + sel.length + " élève(s)";
+      sendBtn.disabled = !sel.length;
+      const first = sel[0] || vis[0] && vis[0][0];
+      preview.textContent = first ? "À : " + first.email + "\nObjet : " + fill(subject.value, first) + "\n\n" + fill(message.value, first) : "";
+    }
+    classSel.addEventListener("change", refresh);
+    subject.addEventListener("input", refresh);
+    message.addEventListener("input", refresh);
+
+    sendBtn.addEventListener("click", () => {
+      const sel = selected();
+      area.replaceChildren(h("div", { class: "card stack confirm" },
+        h("p", {}, "Envoyer maintenant le lien à ", h("strong", { text: sel.length + " élève(s)" }), " depuis votre adresse Gmail ?"),
+        !quiz.open ? h("p", { class: "banner warn", text: "Ce QCM est fermé : les élèves recevront le lien, mais ne pourront commencer qu'une fois le QCM ouvert." }) : null,
+        h("div", { class: "row" },
+          h("button", { class: "btn primary", type: "button", id: "confirmSend", onclick: async (ev) => {
+            ev.target.disabled = true; ev.target.textContent = "Envoi en cours…";
+            try {
+              const res = await teacherPost({ action: "sendLinks", quizId: quiz.id, appUrl, subject: subject.value, message: message.value,
+                recipients: sel.map((e) => ({ nom: e.nom, prenom: e.prenom, classe: e.classe, email: e.email })) });
+              quotaCache = res.quota;
+              area.replaceChildren(h("div", { class: "card stack" },
+                h("div", { class: "banner " + (res.failed.length ? "warn" : "ok"), text: res.sent + " e-mail(s) envoyé(s)" + (res.failed.length ? ", " + res.failed.length + " échec(s)." : ".") }),
+                res.failed.length ? h("ul", { class: "corrlist" }, res.failed.map((f) => h("li", { text: ((f.prenom || "") + " " + (f.nom || "")).trim() + " – " + f.email + " : " + f.raison }))) : null,
+                res.quota !== null && res.quota !== undefined ? h("p", { class: "muted small", text: "Envois encore possibles aujourd'hui : " + res.quota + "." }) : null,
+                h("div", { class: "row" }, h("a", { class: "btn", href: "#prof", text: "Retour à mes QCM" }))));
+            } catch (e) {
+              const auth = /autoris|permission|MailApp|script\.send_mail/i.test(e.message);
+              area.replaceChildren(h("div", { class: "card stack confirm" },
+                h("p", { text: auth ? "Le script n'a pas encore l'autorisation d'envoyer des e-mails. Dans Apps Script, exécutez une fois « autoriserEmails », acceptez l'autorisation, puis publiez une nouvelle version (voir le guide)." : e.message }),
+                h("div", {}, h("button", { class: "btn small", type: "button", onclick: () => area.replaceChildren(), text: "Fermer" }))));
+            }
+          }, text: "Oui, envoyer" }),
+          h("button", { class: "btn ghost", type: "button", onclick: () => area.replaceChildren(), text: "Annuler" }))));
+      area.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+
+    refresh();
+    show(
+      h("div", { class: "row spread" },
+        h("div", { class: "stack" }, h("span", { class: "label", text: "Envoyer le lien" }), h("h1", { text: quiz.title })),
+        h("a", { class: "btn ghost", href: "#prof", text: "Retour" })),
+      !quiz.open ? h("div", { class: "banner warn", text: "Ce QCM est actuellement fermé : pensez à l'ouvrir au début de la séance, sinon les élèves verront « pas encore ouvert »." }) : null,
+      h("section", { class: "card stack" },
+        h("div", { class: "row spread" }, h("h2", { text: "Destinataires" }), classes.length > 1 ? classSel : null),
+        listBox,
+        h("p", { class: "muted small" }, h("a", { href: "#prof/eleves", text: "Modifier la liste d'élèves" }),
+          quotaCache !== null && quotaCache !== undefined ? " · Envois encore possibles aujourd'hui : " + quotaCache : "")),
+      h("section", { class: "card stack" },
+        h("h2", { text: "Message" }),
+        h("label", { class: "field" }, h("span", { text: "Objet" }), subject),
+        h("label", { class: "field" }, h("span", { text: "Texte" }), message),
+        h("p", { class: "muted small", text: "Repères remplacés pour chaque élève : {prenom}, {nom}, {classe}, {titre}, {lien}. Si {lien} est absent, le lien est ajouté à la fin." }),
+        h("span", { class: "label", text: "Aperçu pour le premier élève" }),
+        preview),
+      h("div", { class: "row" }, sendBtn),
+      area);
+  }
+
   /* ---------- Routage ---------- */
 
   function route() {
     if (runCleanup && !location.hash.startsWith("#qcm/")) runCleanup();
-    const parts = decodeURIComponent(location.hash.replace(/^#/, "")).split("/");
+    const [path, query] = location.hash.replace(/^#/, "").split("?");
+    const parts = path.split("/").map((p) => { try { return decodeURIComponent(p); } catch (e) { return p; } });
+    const params = new URLSearchParams(query || "");
     document.getElementById("profLink").hidden = parts[0] === "prof";
-    if (parts[0] === "qcm" && parts[1]) return viewQuiz(parts[1]);
+    if (parts[0] === "qcm" && parts[1]) return viewQuiz(parts[1], params);
+    if (parts[0] === "prof" && parts[1] === "eleves") return viewStudents();
+    if (parts[0] === "prof" && parts[1] === "envoi" && parts[2]) return viewSend(parts[2]);
     if (parts[0] === "prof" && parts[1] === "edit" && parts[2]) return viewEditor(parts[2]);
     if (parts[0] === "prof" && parts[1] === "res" && parts[2]) return viewResults(parts[2]);
     if (parts[0] === "prof" && parts[1] === "apercu" && parts[2]) return viewPreview(parts[2]);
